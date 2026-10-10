@@ -116,6 +116,13 @@ class Collector:
             model, {}).setdefault(
             (field, value), set()).update(objs)
 
+    def _has_signal_listeners(self, model):
+        return (
+            signals.pre_delete.has_listeners(model) or
+            signals.post_delete.has_listeners(model) or
+            signals.m2m_changed.has_listeners(model)
+        )
+
     def can_fast_delete(self, objs, from_field=None):
         """
         Determine if the objects in the given queryset-like or single object
@@ -135,9 +142,7 @@ class Collector:
             model = objs.model
         else:
             return False
-        if (signals.pre_delete.has_listeners(model) or
-                signals.post_delete.has_listeners(model) or
-                signals.m2m_changed.has_listeners(model)):
+        if self._has_signal_listeners(model):
             return False
         # The use of from_field comes from the need to avoid cascade back to
         # parent when parent delete is cascading to child.
@@ -201,7 +206,23 @@ class Collector:
             concrete_model = model._meta.concrete_model
             for ptr in concrete_model._meta.parents.values():
                 if ptr:
-                    parent_objs = [getattr(obj, ptr.name) for obj in new_objs]
+                    parent_objs = []
+                    parent_model = ptr.remote_field.model
+                    for obj in new_objs:
+                        if ptr.is_cached(obj):
+                            parent = ptr.get_cached_value(obj)
+                        else:
+                            # Preserve loaded inherited fields without fetching
+                            # fields deferred on the child just to collect a parent.
+                            field_names = [
+                                field.attname for field in parent_model._meta.concrete_fields
+                                if field.attname in obj.__dict__
+                            ]
+                            parent = parent_model.from_db(
+                                self.using, field_names,
+                                [obj.__dict__[name] for name in field_names],
+                            )
+                        parent_objs.append(parent)
                     self.collect(parent_objs, source=model,
                                  source_attr=ptr.remote_field.related_name,
                                  collect_related=False,
@@ -220,8 +241,19 @@ class Collector:
                     sub_objs = self.related_objects(related, batch)
                     if self.can_fast_delete(sub_objs, from_field=field):
                         self.fast_deletes.append(sub_objs)
-                    elif sub_objs:
-                        field.remote_field.on_delete(self, field, sub_objs, self.using)
+                    else:
+                        related_model = related.related_model
+                        # Signal receivers may need any field. Also preserve
+                        # fields required by explicitly selected relations.
+                        if not (sub_objs.query.select_related or self._has_signal_listeners(related_model)):
+                            referenced_fields = {
+                                foreign_field.attname
+                                for rel in get_candidate_relations_to_delete(related_model._meta)
+                                for foreign_field in rel.field.foreign_related_fields
+                            }
+                            sub_objs = sub_objs.only(*referenced_fields)
+                        if sub_objs:
+                            field.remote_field.on_delete(self, field, sub_objs, self.using)
             for field in model._meta.private_fields:
                 if hasattr(field, 'bulk_related_objects'):
                     # It's something like generic foreign key.
